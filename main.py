@@ -1,168 +1,173 @@
-# Importing necessary libraries
-
-import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-import lifetimes
-
-#Let's make this notebook reproducible 
-np.random.seed(42)
-
-import random
-random.seed(42)
-
 import warnings
-warnings.filterwarnings('ignore')
-
-# Plotting parameters
-# Make the default figures a bit bigger
-plt.rcParams['figure.figsize'] = (7,4.5) 
-plt.rcParams["figure.dpi"] = 140 
-
-sns.set(style="ticks")
-sns.set_context("poster", font_scale = .5, rc={"grid.linewidth": 5})
-
-df1 = pd.read_csv('Dataset/olist_orders_dataset.csv')
-df2 = pd.read_csv('Dataset/olist_customers_dataset.csv')
-df3 = pd.read_csv('Dataset/olist_order_payments_dataset.csv')
-
-cols = ['customer_id', 'order_id', 'order_purchase_timestamp']
-orders = df1[cols]
-orders = orders.set_index('customer_id')
-orders.drop_duplicates(inplace=True)
-
-# too few 
-cols = ['order_id', 'payment_value']
-payment = df3[cols]
-payment = payment.set_index('order_id')
-payment.drop_duplicates(inplace=True)
-
-cols = ['customer_id', 'customer_unique_id']
-customers = df2[cols]
-customers = customers.set_index('customer_id')
-
-elog = pd.concat([orders,customers], axis=1, join='inner')
-elog.reset_index(inplace=True)
-
-cols = ['customer_unique_id', 'order_purchase_timestamp']
-elog = elog[cols]
-
-elog['order_purchase_timestamp'] = pd.to_datetime(elog['order_purchase_timestamp'])
-elog['order_date'] = elog.order_purchase_timestamp.dt.date
-elog['order_date'] = pd.to_datetime(elog['order_date'])
-
-cols = ['customer_unique_id', 'order_date']
-elog = elog[cols]
-
-elog.columns = ['CUSTOMER_ID', 'ORDER_DATE']
+from lifetimes import BetaGeoFitter
+from lifetimes.plotting import plot_frequency_recency_matrix, plot_probability_alive_matrix
 
 
-elog.info()
-print(elog.sample(5))
+# --------------------
+# Load datasets
+# --------------------
+customers = pd.read_csv("Dataset/olist_customers_dataset.csv")
+orders = pd.read_csv("Dataset/olist_orders_dataset.csv", parse_dates=[
+    "order_purchase_timestamp",
+    "order_approved_at",
+    "order_delivered_carrier_date",
+    "order_delivered_customer_date",
+    "order_estimated_delivery_date"
+])
+payments = pd.read_csv("Dataset/olist_order_payments_dataset.csv")
+# Merge orders with customers
+orders_customers = pd.merge(orders, customers, on="customer_id", how="left")
 
-# Date range of orders¶
-print(elog.ORDER_DATE.describe())
+# Merge with payments (only keep relevant payment rows — optional)
+full_df = pd.merge(orders_customers, payments, on="order_id", how="left")
+
+# Keep only delivered orders
+full_df = full_df[full_df["order_status"] == "delivered"]
 
 
-# Creating RFM Matrix based on transaction log¶
-# Spliting calibration and holdout period
-# We will use the last 3 months as holdout period
-# and the rest as calibration period
-calibration_period_ends = '2018-06-30'
+# ==== Build transaction log in the shape lifetimes expects ====
+# Use the same elog you already prepared earlier:
+# elog has: ['CUSTOMER_ID', 'ORDER_DATE'] with ORDER_DATE as datetime64
 
+from lifetimes.utils import summary_data_from_transaction_data
+from lifetimes import BetaGeoFitter, ModifiedBetaGeoFitter
+from lifetimes.plotting import (
+    plot_frequency_recency_matrix,
+    plot_probability_alive_matrix,
+    plot_calibration_purchases_vs_holdout_purchases,
+    plot_cumulative_transactions,
+    plot_incremental_transactions,
+)
+import numpy as np
+elog = full_df[['customer_id', 'order_purchase_timestamp']].rename(
+    columns={'customer_id': 'CUSTOMER_ID', 'order_purchase_timestamp': 'ORDER_DATE'})
+# 1) Create the summary directly from transactions (this avoids many pitfalls)
+#    Keep units in DAYS by setting freq='D'.
+observation_end = elog['ORDER_DATE'].max()
+summary = summary_data_from_transaction_data(
+    transactions=elog,
+    customer_id_col='CUSTOMER_ID',
+    datetime_col='ORDER_DATE',
+    observation_period_end=observation_end,
+    freq='D'  # days
+)
+
+# Optional sanity checks
+# Drop impossible rows and NaNs (rare, but good hygiene)
+summary = summary.replace([np.inf, -np.inf], np.nan).dropna()
+summary = summary[(summary['T'] > 0) & (summary['recency'] >= 0) & (summary['recency'] <= summary['T'])]
+
+# Winsorize extremes to stabilize optimization (helps with overflow)
+for col in ['recency', 'T']:
+    cap = summary[col].quantile(0.99)
+    summary[col] = np.minimum(summary[col], cap)
+
+# You can keep zero-frequency customers for BG/NBD; the fitter handles them.
+print('Rows for fitting:', len(summary), 
+      ' | freq>0:', (summary['frequency']>0).sum(), 
+      ' | zeros:', (summary['frequency']==0).sum())
+
+# 2) Fit BG/NBD with a stabilizing penalizer; fall back to MBG/NBD if needed
+def fit_bgnbd_stable(df):
+    for penal in [0.1, 0.01, 0.001, 0.0001]:
+        try:
+            bgf = BetaGeoFitter(penalizer_coef=penal)
+            
+            bgf.fit(df['frequency'], df['recency'], df['T'], verbose=True)
+            print(f'BG/NBD converged with penalizer={penal}')
+            return bgf, 'BG/NBD'
+        except Exception as e:
+            print(f'BG/NBD failed (penalizer={penal}): {e}')
+    # Fallback: Modified BG/NBD is often more stable
+    mbg = ModifiedBetaGeoFitter(penalizer_coef=0.1)
+    mbg.fit(df['frequency'], df['recency'], df['T'], verbose=True)
+    print('Fell back to Modified BG/NBD (MBG/NBD).')
+    return mbg, 'MBG/NBD'
+
+model, model_name = fit_bgnbd_stable(summary)
+print(model)
+
+# 3) Predictions (next 90 days)
+t_future = 90.0  # days
+summary['predicted_purchases_90d'] = model.conditional_expected_number_of_purchases_up_to_time(
+    t_future, summary['frequency'], summary['recency'], summary['T']
+)
+summary['p_alive'] = model.conditional_probability_alive(
+    summary['frequency'], summary['recency'], summary['T']
+)
+
+# 4) Plots (will work for either BG/NBD or MBG/NBD)
+plt.figure(figsize=(8, 6))
+plot_frequency_recency_matrix(model)
+plt.title(f'{model_name} – Expected Transactions by Frequency/Recency')
+plt.tight_layout()
+plt.show()
+sns.despine()
+
+plt.figure(figsize=(8, 6))
+plot_probability_alive_matrix(model)
+plt.title(f'{model_name} – Probability Alive Matrix')
+plt.tight_layout()
+plt.show()
+sns.despine()
+
+# 5) Calibration vs Holdout, Cumulative & Incremental (using your earlier split)
+# Recreate your calibration/holdout split using the same elog and dates
 from lifetimes.utils import calibration_and_holdout_data
 
-summary_cal_holdout = calibration_and_holdout_data(elog, 
-                                                   customer_id_col = 'CUSTOMER_ID', 
-                                                   datetime_col = 'ORDER_DATE', 
-                                                   freq = 'D', #days
-                                        calibration_period_end=calibration_period_ends,
-                                        observation_period_end='2018-09-28' )
-
-# Feature set¶
-print(summary_cal_holdout.head())
-
-from lifetimes import ModifiedBetaGeoFitter
-
-mbgnbd = ModifiedBetaGeoFitter(penalizer_coef=0.01)
-mbgnbd.fit(summary_cal_holdout['frequency_cal'], 
-        summary_cal_holdout['recency_cal'], 
-        summary_cal_holdout['T_cal'],
-       verbose=True)
-
-print(mbgnbd)
-# Predictions for each customer in the holdout period
-t = 90 # days to predict in the future 
-summary_cal_holdout['predicted_purchases'] = mbgnbd.conditional_expected_number_of_purchases_up_to_time(t, 
-                                                                                      summary_cal_holdout['frequency_cal'], 
-                                                                                      summary_cal_holdout['recency_cal'], 
-                                                                                      summary_cal_holdout['T_cal'])
-
-summary_cal_holdout['p_alive'] = mbgnbd.conditional_probability_alive(summary_cal_holdout['frequency_cal'], 
-                                                                         summary_cal_holdout['recency_cal'], 
-                                                                         summary_cal_holdout['T_cal'])
-summary_cal_holdout['p_alive'] = np.round(summary_cal_holdout['p_alive'] / summary_cal_holdout['p_alive'].max(), 2)
-
-print(summary_cal_holdout.sample(2).T)
-
-# Accessing the model fit 
-from lifetimes.plotting import plot_period_transactions
-ax = plot_period_transactions(mbgnbd, max_frequency=7)
-ax.set_yscale('log')
-plt.show()
-sns.despine()
-
-from lifetimes.plotting import plot_calibration_purchases_vs_holdout_purchases
-
-plot_calibration_purchases_vs_holdout_purchases(mbgnbd, summary_cal_holdout)
-plt.show()
-sns.despine()
-
-# Customer Probability History
-from lifetimes.plotting import plot_history_alive
-from datetime import date
-from pylab import figure, text, scatter, show
-
-individual = summary_cal_holdout.iloc[4942]
-
-id = individual.name
-t = 365*50
-
-today = date.today()
-two_year_ago = today.replace(year=today.year - 2)
-one_year_from_now = today.replace(year=today.year + 1)
-
-id = 1  # or whichever customer
-
-sp_trans = (
-    elog.loc[elog['CUSTOMER_ID'] == id, ['ORDER_DATE']]
-    .copy()
-)
-
-sp_trans['ORDER_DATE'] = pd.to_datetime(sp_trans['ORDER_DATE'])
-sp_trans['orders'] = 1  # numeric
-
-# Make ORDER_DATE the index because plot_history_alive expects that
-sp_trans = sp_trans.set_index('ORDER_DATE')
-
-from lifetimes.utils import calculate_alive_path 
-from lifetimes.plotting import plot_history_alive
-
-ax = plot_history_alive(
-    mbgnbd,
-    t,
-    sp_trans,
+calibration_period_ends = '2018-06-30'
+summary_cal_holdout = calibration_and_holdout_data(
+    elog,
+    customer_id_col='CUSTOMER_ID',
     datetime_col='ORDER_DATE',
-    transaction_col='orders',
-    start_date=two_year_ago,
-    freq='D'
+    freq='D',
+    calibration_period_end=calibration_period_ends,
+    observation_period_end='2018-09-28',
 )
-ax.set_title(f'Customer {id} - Probability of being alive')
-ax.set_xlabel('Date')
-ax.set_ylabel('Probability of being alive')
-ax.set_xlim(two_year_ago, one_year_from_now)
-ax.set_ylim(0, 1)
-ax.axvline(x=today, color='red', linestyle='--', label='Today')
-ax.legend()
+
+plt.figure(figsize=(7, 5))
+plot_calibration_purchases_vs_holdout_purchases(model, summary_cal_holdout)
+plt.title(f'{model_name} – Calibration vs Holdout Purchases')
+plt.tight_layout()
 plt.show()
+sns.despine()
+
+# Cumulative & Incremental transactions plots prefer the raw transactions
+from datetime import datetime
+elog_renamed = elog.rename(columns={'ORDER_DATE': 'date'})  # expected col name
+t_total = (elog_renamed['date'].max() - elog_renamed['date'].min()).days
+t_cal = (datetime.strptime('2018-06-30', '%Y-%m-%d') - elog_renamed['date'].min()).days
+
+plt.figure(figsize=(8, 5))
+plot_cumulative_transactions(model, elog_renamed, 'date', 'CUSTOMER_ID', t_total, t_cal, freq='D')
+plt.title(f'{model_name} – Cumulative Transactions')
+plt.tight_layout()
+plt.show()
+sns.despine()
+
+plt.figure(figsize=(8, 5))
+plot_incremental_transactions(model, elog_renamed, 'date', 'CUSTOMER_ID', t_total, t_cal, freq='D')
+plt.title(f'{model_name} – Incremental Transactions')
+plt.tight_layout()
+plt.show()
+sns.despine()
+
+# 6) Save results
+summary_out = summary.copy()
+summary_out['p_alive'] = summary_out['p_alive'].round(4)
+summary_out['predicted_purchases_90d'] = summary_out['predicted_purchases_90d'].round(3)
+summary_out.to_csv('customer_lifetime_predictions.csv', index=False)
+print('Saved: customer_lifetime_predictions.csv')
+
+
+# Plot calibration vs holdout purchases
+plt.figure(figsize=(7, 5))  
+plot_calibration_purchases_vs_holdout_purchases(model, summary_cal_holdout)
+plt.title(f'{model_name} – Calibration vs Holdout Purchases')
+plt.tight_layout()
+plt.show()
+sns.despine()
+
